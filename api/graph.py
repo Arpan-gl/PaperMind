@@ -1,4 +1,4 @@
-﻿"""
+"""
 PaperMind - Graph API
 Source: docs/loop_flow.md (lines 377-386)
 
@@ -59,10 +59,26 @@ async def get_current_user(user_id: str = Query(default="default_user")) -> str:
 
 
 @router.get("/graph", response_model=GraphResponse)
-async def get_graph(user_id: str = Depends(get_current_user)):
-    """Get full graph data for Cytoscape.js rendering."""
+async def get_graph(
+    user_id: str = Depends(get_current_user),
+    include_claims: bool = Query(default=True, description="Include Claim nodes in the graph"),
+    include_citations: bool = Query(default=False, description="Include citation-stub Paper nodes"),
+    max_claims: int = Query(default=5, ge=1, le=50, description="Max Claim nodes per paper (sorted by RGS score)"),
+):
+    """Get filtered graph data for Cytoscape.js rendering.
+
+    Query params:
+      include_claims     — show top-N claim nodes per paper (default: true)
+      include_citations  — show citation-stub papers (default: false)
+      max_claims         — how many claims per paper (default: 5, max: 50)
+    """
     try:
-        graph_data = kuzu_client.get_full_graph(user_id)
+        graph_data = kuzu_client.get_full_graph(
+            user_id,
+            include_claims=include_claims,
+            include_citations=include_citations,
+            max_claims_per_paper=max_claims,
+        )
         return GraphResponse(**graph_data)
     except Exception as e:
         logger.error(f"Failed to get graph: {e}")

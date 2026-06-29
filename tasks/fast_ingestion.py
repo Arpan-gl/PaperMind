@@ -10,6 +10,25 @@ from threading import Thread
 logger = logging.getLogger("papermind.fast_ingestion")
 
 
+def _preinit_cognee() -> None:
+    """Pre-initialize Cognee once at worker startup (not per-job)."""
+    try:
+        import asyncio as _aio
+        from core.cognee_client import setup_cognee
+        _aio.run(setup_cognee())
+        logger.info("Cognee pre-initialized at worker startup")
+    except Exception as exc:
+        logger.warning("Cognee pre-init failed (will retry on first call): %s", exc)
+
+
+# Fire-and-forget — safe to call at module import time
+try:
+    _preinit_cognee()
+except Exception:
+    pass
+
+
+
 def run_ingestion_job(pdf_path: str, user_id: str, task_id: str):
     """Run ingestion and always leave its durable job in a terminal state."""
     from api.papers import update_job
@@ -115,34 +134,74 @@ async def _run_fast_ingestion(pdf_path: str, user_id: str, task_id: str):
 
 
 def _start_memory_sync(extraction: dict, delta: dict, user_id: str, task_id: str):
-    """Persist full Cognee memory after Kuzu is already available to the user."""
+    """Persist structured extraction to Cognee after Kuzu is already available.
+
+    Optimised path vs. the original:
+      - Calls cognee.add() with the compact JSON extraction (already structured).
+        This indexes the text for retrieval WITHOUT triggering the full
+        LLM knowledge-graph extraction pass (cognify), which was the main
+        source of latency in the old store_paper_to_cognee() helper.
+      - cognee.memify() still runs for the graph delta (Agent 2 output)
+        so the living-graph contract is preserved.
+    """
 
     def sync_memory():
-        from agents.pdf_analyst import store_paper_to_cognee
+        import cognee
         from api.papers import update_job
-        from core import cognee_client
+        from core.cognee_client import _dataset_name, _serialize_with_metadata, setup_cognee
+        import json
 
         async def sync():
-            paper_stored = await store_paper_to_cognee(extraction, user_id)
-            delta_stored = await cognee_client.memify(
-                data={
-                    "paper_id": extraction.get("paper_id", ""),
-                    "delta": {
-                        **delta.get("delta_summary", {}),
-                        "new_gaps": delta.get("new_gaps", []),
+            await setup_cognee()  # no-op if already done
+
+            dataset = _dataset_name(user_id)
+            paper_id = extraction.get("paper_id", "")
+
+            # ── Lightweight add: index extraction JSON for vector recall ─
+            # Splits the 5-module JSON into smaller chunks so embeddings
+            # are granular; no LLM call required by cognee.add().
+            try:
+                payload = _serialize_with_metadata(
+                    extraction,
+                    {
+                        "user_id": user_id,
+                        "paper_id": paper_id,
+                        "type": "paper_extraction",
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
                     },
-                },
-                metadata={
-                    "user_id": user_id,
-                    "paper_id": extraction.get("paper_id", ""),
-                    "type": "graph_delta",
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                },
-            )
+                )
+                await cognee.add(data=payload, dataset_name=dataset)
+                paper_stored = True
+            except Exception as exc:
+                logger.warning("cognee.add() for extraction failed: %s", exc)
+                paper_stored = False
+
+            # ── memify: graph delta (preserves living-graph contract) ───
+            delta_stored = False
+            try:
+                from core.cognee_client import memify
+                delta_stored = await memify(
+                    data={
+                        "paper_id": paper_id,
+                        "delta": {
+                            **delta.get("delta_summary", {}),
+                            "new_gaps": delta.get("new_gaps", []),
+                        },
+                    },
+                    metadata={
+                        "user_id": user_id,
+                        "paper_id": paper_id,
+                        "type": "graph_delta",
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    },
+                )
+            except Exception as exc:
+                logger.warning("memify() failed: %s", exc)
+
             ready = bool(paper_stored and delta_stored)
             update_job(
                 task_id,
-                cognee_status="ready" if ready else "failed",
+                cognee_status="ready" if ready else "partial",
                 cognee_stored=ready,
             )
 

@@ -193,56 +193,109 @@ def get_paper_ids_for_user(user_id: str) -> list[str]:
     return [r["p.paper_id"] for r in rows]
 
 
-def get_full_graph(user_id: str) -> dict:
+def get_full_graph(
+    user_id: str,
+    include_claims: bool = True,
+    include_citations: bool = False,
+    max_claims_per_paper: int = 5,
+) -> dict:
     """
-    Return the full graph (nodes + edges) for a user, suitable for
+    Return the graph (nodes + edges) for a user, suitable for
     Cytoscape.js rendering in the frontend.
-    """
-    nodes = []
-    edges = []
 
-    # Papers
+    Filtering behaviour (reduces hairball clutter):
+      • Only "real" papers (pdf_url != '') are included as nodes unless
+        include_citations=True explicitly requests citation stubs.
+      • Claims are limited to the top-N by rgs_score per paper
+        (default 5) — the most research-gap-relevant ones.
+      • Each Claim node carries a ``parent`` field equal to its paper_id
+        so Cytoscape can use compound nodes to group them visually.
+
+    Args:
+        user_id:              Scope graph to this user.
+        include_claims:       Include Claim nodes (default True).
+        include_citations:    Include citation-stub Paper nodes whose pdf
+                              was never uploaded (default False).
+        max_claims_per_paper: Max Claim nodes returned per paper (default 5).
+    """
+    nodes: list[dict] = []
+    edges: list[dict] = []
+
+    # ── Real uploaded papers ──────────────────────────────────────
     papers = execute(
-        "MATCH (p:Paper) WHERE p.user_id = $uid "
+        "MATCH (p:Paper) WHERE p.user_id = $uid AND p.pdf_url <> '' "
         "RETURN p.paper_id, p.title, p.pub_year, p.venue",
-        {"uid": user_id}
+        {"uid": user_id},
     )
+    paper_id_set = {p["p.paper_id"] for p in papers}
     for p in papers:
         nodes.append({
             "data": {
                 "id": p["p.paper_id"],
-                "label": p["p.title"],
+                "label": (p["p.title"] or "")[:60],
                 "type": "Paper",
                 "pub_year": p["p.pub_year"],
                 "venue": p["p.venue"],
             }
         })
 
-    # Claims
-    claims = execute(
-        "MATCH (p:Paper)-[:HAS_CLAIM]->(c:Claim) "
-        "WHERE p.user_id = $uid "
-        "RETURN c.claim_id, c.text, c.rgs_score, c.is_gap, c.paper_id",
-        {"uid": user_id}
-    )
-    for c in claims:
-        nodes.append({
-            "data": {
-                "id": c["c.claim_id"],
-                "label": c["c.text"][:80] + "..." if len(c.get("c.text", "")) > 80 else c.get("c.text", ""),
-                "type": "Claim",
-                "rgs_score": c.get("c.rgs_score"),
-                "is_gap": c.get("c.is_gap"),
-            }
-        })
+    # ── Citation-stub papers (opt-in) ─────────────────────────────
+    if include_citations:
+        stubs = execute(
+            "MATCH (p:Paper) WHERE p.user_id = $uid AND p.pdf_url = '' "
+            "RETURN p.paper_id, p.title, p.pub_year, p.venue",
+            {"uid": user_id},
+        )
+        for p in stubs:
+            paper_id_set.add(p["p.paper_id"])
+            nodes.append({
+                "data": {
+                    "id": p["p.paper_id"],
+                    "label": (p["p.title"] or "")[:60],
+                    "type": "CitationStub",
+                    "pub_year": p["p.pub_year"],
+                }
+            })
 
-    # Methods
+    # ── Claims — top-N per paper by rgs_score ────────────────────
+    shown_claim_ids: set[str] = set()
+    if include_claims:
+        all_claims = execute(
+            "MATCH (p:Paper)-[:HAS_CLAIM]->(c:Claim) "
+            "WHERE p.user_id = $uid AND p.pdf_url <> '' "
+            "RETURN c.claim_id, c.text, c.rgs_score, c.is_gap, c.paper_id "
+            "ORDER BY c.rgs_score DESC",
+            {"uid": user_id},
+        )
+        # Group by paper, take top-N per paper
+        paper_claim_count: dict[str, int] = {}
+        for c in all_claims:
+            pid = c.get("c.paper_id", "")
+            if paper_claim_count.get(pid, 0) >= max_claims_per_paper:
+                continue
+            paper_claim_count[pid] = paper_claim_count.get(pid, 0) + 1
+            cid = c["c.claim_id"]
+            shown_claim_ids.add(cid)
+            text = c.get("c.text", "") or ""
+            nodes.append({
+                "data": {
+                    "id": cid,
+                    "label": text[:70] + "…" if len(text) > 70 else text,
+                    "type": "Claim",
+                    "rgs_score": c.get("c.rgs_score"),
+                    "is_gap": c.get("c.is_gap"),
+                    "paper_id": pid,  # which paper this claim belongs to
+                }
+            })
+
+    # ── Methods ──────────────────────────────────────────────────
     methods = execute(
         "MATCH (p:Paper)-[:PROPOSES]->(m:Method) "
-        "WHERE p.user_id = $uid "
+        "WHERE p.user_id = $uid AND p.pdf_url <> '' "
         "RETURN DISTINCT m.node_id, m.name, m.paper_count",
-        {"uid": user_id}
+        {"uid": user_id},
     )
+    shown_method_ids = {m["m.node_id"] for m in methods}
     for m in methods:
         nodes.append({
             "data": {
@@ -253,86 +306,92 @@ def get_full_graph(user_id: str) -> dict:
             }
         })
 
-    # HAS_CLAIM edges
-    hc_edges = execute(
-        "MATCH (p:Paper)-[r:HAS_CLAIM]->(c:Claim) "
-        "WHERE p.user_id = $uid "
-        "RETURN p.paper_id, c.claim_id, r.section",
-        {"uid": user_id}
-    )
-    for e in hc_edges:
-        edges.append({
-            "data": {
-                "source": e["p.paper_id"],
-                "target": e["c.claim_id"],
-                "type": "HAS_CLAIM",
-                "section": e.get("r.section"),
-            }
-        })
+    # ── HAS_CLAIM edges (only for shown claims) ───────────────────
+    if include_claims and shown_claim_ids:
+        hc_edges = execute(
+            "MATCH (p:Paper)-[r:HAS_CLAIM]->(c:Claim) "
+            "WHERE p.user_id = $uid AND p.pdf_url <> '' "
+            "RETURN p.paper_id, c.claim_id, r.section",
+            {"uid": user_id},
+        )
+        for e in hc_edges:
+            if e["c.claim_id"] in shown_claim_ids:
+                edges.append({
+                    "data": {
+                        "source": e["p.paper_id"],
+                        "target": e["c.claim_id"],
+                        "type": "HAS_CLAIM",
+                        "section": e.get("r.section"),
+                    }
+                })
 
-    # CITES edges
+    # ── CITES edges (only between shown papers) ───────────────────
     cite_edges = execute(
         "MATCH (p1:Paper)-[r:CITES]->(p2:Paper) "
         "WHERE p1.user_id = $uid "
         "RETURN p1.paper_id, p2.paper_id, r.strength, r.cite_type",
-        {"uid": user_id}
+        {"uid": user_id},
     )
     for e in cite_edges:
-        edges.append({
-            "data": {
-                "source": e["p1.paper_id"],
-                "target": e["p2.paper_id"],
-                "type": "CITES",
-                "strength": e.get("r.strength"),
-                "cite_type": e.get("r.cite_type"),
-            }
-        })
+        if e["p1.paper_id"] in paper_id_set and e["p2.paper_id"] in paper_id_set:
+            edges.append({
+                "data": {
+                    "source": e["p1.paper_id"],
+                    "target": e["p2.paper_id"],
+                    "type": "CITES",
+                    "strength": e.get("r.strength"),
+                    "cite_type": e.get("r.cite_type"),
+                }
+            })
 
-    # CONTRADICTS edges
-    contra_edges = execute(
-        "MATCH (c1:Claim)-[r:CONTRADICTS]->(c2:Claim) "
-        "RETURN c1.claim_id, c2.claim_id, r.confidence",
-    )
-    for e in contra_edges:
-        edges.append({
-            "data": {
-                "source": e["c1.claim_id"],
-                "target": e["c2.claim_id"],
-                "type": "CONTRADICTS",
-                "confidence": e.get("r.confidence"),
-            }
-        })
+    # ── CONTRADICTS / SUPPORTS (only between shown claims) ────────
+    if include_claims and shown_claim_ids:
+        contra_edges = execute(
+            "MATCH (c1:Claim)-[r:CONTRADICTS]->(c2:Claim) "
+            "RETURN c1.claim_id, c2.claim_id, r.confidence",
+        )
+        for e in contra_edges:
+            if e["c1.claim_id"] in shown_claim_ids and e["c2.claim_id"] in shown_claim_ids:
+                edges.append({
+                    "data": {
+                        "source": e["c1.claim_id"],
+                        "target": e["c2.claim_id"],
+                        "type": "CONTRADICTS",
+                        "confidence": e.get("r.confidence"),
+                    }
+                })
 
-    # SUPPORTS edges
-    supp_edges = execute(
-        "MATCH (c1:Claim)-[r:SUPPORTS]->(c2:Claim) "
-        "RETURN c1.claim_id, c2.claim_id, r.confidence",
-    )
-    for e in supp_edges:
-        edges.append({
-            "data": {
-                "source": e["c1.claim_id"],
-                "target": e["c2.claim_id"],
-                "type": "SUPPORTS",
-                "confidence": e.get("r.confidence"),
-            }
-        })
+        supp_edges = execute(
+            "MATCH (c1:Claim)-[r:SUPPORTS]->(c2:Claim) "
+            "RETURN c1.claim_id, c2.claim_id, r.confidence",
+        )
+        for e in supp_edges:
+            if e["c1.claim_id"] in shown_claim_ids and e["c2.claim_id"] in shown_claim_ids:
+                edges.append({
+                    "data": {
+                        "source": e["c1.claim_id"],
+                        "target": e["c2.claim_id"],
+                        "type": "SUPPORTS",
+                        "confidence": e.get("r.confidence"),
+                    }
+                })
 
-    # PROPOSES edges
+    # ── PROPOSES edges (only between shown papers/methods) ────────
     prop_edges = execute(
         "MATCH (p:Paper)-[:PROPOSES]->(m:Method) "
-        "WHERE p.user_id = $uid "
+        "WHERE p.user_id = $uid AND p.pdf_url <> '' "
         "RETURN p.paper_id, m.node_id",
-        {"uid": user_id}
+        {"uid": user_id},
     )
     for e in prop_edges:
-        edges.append({
-            "data": {
-                "source": e["p.paper_id"],
-                "target": e["m.node_id"],
-                "type": "PROPOSES",
-            }
-        })
+        if e["m.node_id"] in shown_method_ids:
+            edges.append({
+                "data": {
+                    "source": e["p.paper_id"],
+                    "target": e["m.node_id"],
+                    "type": "PROPOSES",
+                }
+            })
 
     return {"nodes": nodes, "edges": edges}
 

@@ -1,8 +1,9 @@
 {
-  "/chat/page": "app/chat/page.js",
-  "/api/[...path]/route": "app/api/[...path]/route.js",
-  "/dashboard/page": "app/dashboard/page.js",
-  "/login/page": "app/login/page.js",
+  "/page": "app/page.js",
+  "/graph/page": "app/graph/page.js",
+  "/upload/page": "app/upload/page.js",
   "/gaps/page": "app/gaps/page.js",
-  "/graph/page": "app/graph/page.js"
+  "/api/[...path]/route": "app/api/[...path]/route.js",
+  "/chat/page": "app/chat/page.js",
+  "/dashboard/page": "app/dashboard/page.js"
 }
