@@ -1,0 +1,18 @@
+# Ignore the environment variables file
+.env
+dist
+.venv
+
+# Ignore dependency folders
+node_modules/
+__pycache__/
+
+# Ignore log files
+*.log
+
+# Ignore OS files
+.DS_Store
+
+kuzu_graph
+cognee_db
+uploads

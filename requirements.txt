@@ -1,0 +1,25 @@
+# ── PaperMind Backend (Python 3.12.7) ──
+
+# Memory layer — drives most of the FastAPI/web stack versions
+cognee==1.2.2
+
+# PaperMind-specific services
+celery==5.3.6
+redis>=5.0.3,<6.0.0
+kuzu==0.6.0
+
+# PDF parsing + graph deduplication (used by agents/)
+pymupdf>=1.24.0
+sentence-transformers>=3.0.0
+numpy>=1.26.4,<4.0.0
+
+# Must satisfy cognee 1.2.2 (do not pin older versions)
+fastapi>=0.116.2,<1.0.0
+uvicorn>=0.34.0,<1.0.0
+openai>=1.80.1
+pydantic>=2.10.5
+pydantic-settings>=2.2.1
+python-multipart>=0.0.22
+websockets>=15.0.1,<16.0.0
+python-dotenv>=1.0.1,<2.0.0
+httpx>=0.27.0
