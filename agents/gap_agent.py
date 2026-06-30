@@ -8,12 +8,15 @@ Output:   Ranked gap report with RGS scores
 PASS:     75 / 100
 """
 
+import asyncio
 import json
 import logging
+import os
 from datetime import datetime
 
 import numpy as np
 
+from core.embedding_client import embed_texts
 from core.openrouter_client import qwen_call
 from core import cognee_client
 from core import kuzu_client
@@ -22,6 +25,14 @@ from core.rgs_calculator import classify_gap, compute_rgs
 logger = logging.getLogger("papermind.agent4")
 
 GAP_DEDUP_COSINE = 0.92
+ENABLE_GAP_SYNTHESIS = os.environ.get("PAPERMIND_ENABLE_GAP_SYNTHESIS", "false").lower() in {
+    "1",
+    "true",
+    "yes",
+}
+GAP_SYNTHESIS_TIMEOUT_SECONDS = float(
+    os.environ.get("PAPERMIND_GAP_SYNTHESIS_TIMEOUT_SECONDS", "20")
+)
 
 AGENT_4_PROMPT = """You are the Gap Detection Agent in PaperMind. You implement RGS(v) - the Research
 Gap Score - PaperMind's novel metric extending Agents-K1's O5 operator.
@@ -193,9 +204,10 @@ async def agent_4_gap_agent(
             "source_query": "untested_claims",
         })
 
-    gap_candidates = _deduplicate_gaps(gap_candidates)
+    gap_candidates = await _deduplicate_gaps(gap_candidates)
     gap_candidates.sort(key=lambda g: g.get("rgs_score", 0), reverse=True)
     gap_candidates = gap_candidates[:10]
+    logger.info("Gap candidate pool prepared: %s", len(gap_candidates))
 
     judge_feedback = ""
     if memory_context:
@@ -209,7 +221,7 @@ async def agent_4_gap_agent(
         except (json.JSONDecodeError, TypeError):
             pass
 
-    if gap_candidates:
+    if gap_candidates and ENABLE_GAP_SYNTHESIS:
         desc_prompt = AGENT_4_PROMPT.format(
             memory_context=memory_context[:2000] if memory_context else "No prior reports.",
             attempt=attempt,
@@ -220,11 +232,17 @@ async def agent_4_gap_agent(
         )
 
         try:
-            desc_response = await qwen_call(
-                system_prompt=desc_prompt,
-                user_message=f"Generate gap report for these {len(gap_candidates)} candidates:\n{json.dumps(gap_candidates[:10], indent=2)}",
-                temperature=0.3,
-                json_mode=True,
+            desc_response = await asyncio.wait_for(
+                qwen_call(
+                    system_prompt=desc_prompt,
+                    user_message=(
+                        f"Generate gap report for these {len(gap_candidates)} candidates:\n"
+                        f"{json.dumps(gap_candidates[:10], indent=2)}"
+                    ),
+                    temperature=0.3,
+                    json_mode=True,
+                ),
+                timeout=GAP_SYNTHESIS_TIMEOUT_SECONDS,
             )
 
             try:
@@ -239,6 +257,8 @@ async def agent_4_gap_agent(
                 pass
         except Exception as e:
             logger.warning(f"Gap description synthesis unavailable, using deterministic copy: {e}")
+    elif gap_candidates:
+        logger.info("Gap synthesis skipped for request path; returning deterministic gap report")
 
     for gap in gap_candidates:
         gap["gap_type"] = classify_gap(
@@ -292,14 +312,16 @@ async def agent_4_gap_agent(
     return gap_report
 
 
-def _deduplicate_gaps(gaps: list[dict]) -> list[dict]:
+async def _deduplicate_gaps(gaps: list[dict]) -> list[dict]:
     """Deduplicate gaps using cosine similarity > 0.92."""
     if len(gaps) <= 1:
         return gaps
 
+    texts = [g.get("claim_text", "") for g in gaps]
     try:
-        from sentence_transformers import SentenceTransformer
-        model = SentenceTransformer("all-MiniLM-L6-v2")
+        embeddings = await embed_texts(texts)
+        if len(embeddings) == 0:
+            raise RuntimeError("no embeddings returned")
     except Exception:
         seen = set()
         deduped = []
@@ -309,9 +331,6 @@ def _deduplicate_gaps(gaps: list[dict]) -> list[dict]:
                 seen.add(text)
                 deduped.append(g)
         return deduped
-
-    texts = [g.get("claim_text", "") for g in gaps]
-    embeddings = model.encode(texts)
 
     to_remove = set()
     for i in range(len(gaps)):

@@ -1,4 +1,4 @@
-# PaperMind Docker Compose — Local Development
+# PaperMind Docker Compose - Local Development
 # Provides Redis for Celery broker + result backend
 
 version: "3.9"
@@ -17,5 +17,25 @@ services:
       timeout: 5s
       retries: 3
 
+  embeddings:
+    image: python:3.12-slim
+    working_dir: /app
+    volumes:
+      - ./:/app
+      - hf_cache:/hf_cache
+    environment:
+      PAPERMIND_EMBEDDING_MODEL: all-MiniLM-L6-v2
+      SENTENCE_TRANSFORMERS_HOME: /hf_cache
+      HF_HOME: /hf_cache
+    command: >
+      sh -lc "pip install --no-cache-dir -r requirements.txt &&
+      uvicorn embedding_service:app --host 0.0.0.0 --port 8001"
+    ports:
+      - "8001:8001"
+    depends_on:
+      redis:
+        condition: service_healthy
+
 volumes:
   redis_data:
+  hf_cache:

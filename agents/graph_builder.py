@@ -27,6 +27,7 @@ from datetime import datetime
 
 import numpy as np
 
+from core.embedding_client import embed_texts
 from core.openrouter_client import qwen_call
 from core import cognee_client
 from core import kuzu_client
@@ -112,16 +113,6 @@ For every Claim node affected:
 }}"""
 
 
-def _get_embedding_model():
-    """Lazy-load sentence-transformers for entity deduplication."""
-    try:
-        from sentence_transformers import SentenceTransformer
-        return SentenceTransformer("all-MiniLM-L6-v2")
-    except Exception as e:
-        logger.warning(f"SentenceTransformer unavailable: {e}")
-        return None
-
-
 def _cosine_similarity(vec_a: np.ndarray, vec_b: np.ndarray) -> float:
     """Compute cosine similarity between two vectors."""
     dot = np.dot(vec_a, vec_b)
@@ -160,10 +151,6 @@ async def agent_2_graph_builder(
     rgs_nodes_updated = 0
     new_gaps = []
     cypher_executed = []
-
-    # Loading sentence-transformers is expensive. Delay it until there is an
-    # existing entity to compare; the first paper needs no embedding model.
-    model = None
 
     # ═══ STEP 1: Create Paper node ═══════════════════════════════
     meta = extraction.get("A_Meta", {})
@@ -229,48 +216,48 @@ async def agent_2_graph_builder(
         )
 
         merged = False
-        if existing_methods and model is None:
-            model = _get_embedding_model()
-        if model and existing_methods:
-            new_emb = model.encode([method_name])[0]
-            for existing in existing_methods:
-                existing_emb = model.encode([existing["m.name"]])[0]
-                sim = _cosine_similarity(new_emb, existing_emb)
-                if sim > METHOD_COSINE_THRESHOLD:
-                    # MERGE — preserve stable node_id (Proposition 1)
-                    kuzu_client.execute_write(
-                        "MATCH (m:Method {node_id: $nid}) "
-                        "SET m.paper_count = m.paper_count + 1",
-                        {"nid": existing["m.node_id"]},
-                    )
-                    nodes_merged += 1
-                    merged = True
+        if existing_methods:
+            method_texts = [method_name] + [existing.get("m.name", "") for existing in existing_methods]
+            embeddings = await embed_texts(method_texts)
+            if len(embeddings) > 0:
+                new_emb = embeddings[0]
+                for existing, existing_emb in zip(existing_methods, embeddings[1:]):
+                    sim = _cosine_similarity(new_emb, existing_emb)
+                    if sim > METHOD_COSINE_THRESHOLD:
+                        # MERGE - preserve stable node_id (Proposition 1)
+                        kuzu_client.execute_write(
+                            "MATCH (m:Method {node_id: $nid}) "
+                            "SET m.paper_count = m.paper_count + 1",
+                            {"nid": existing["m.node_id"]},
+                        )
+                        nodes_merged += 1
+                        merged = True
 
-                    # Cross-paper USES_SAME_METHOD edge
-                    existing_papers = kuzu_client.execute(
-                        "MATCH (p:Paper)-[:PROPOSES]->(m:Method {node_id: $nid}) "
-                        "RETURN p.paper_id",
-                        {"nid": existing["m.node_id"]},
-                    )
-                    for ep in existing_papers:
-                        if ep["p.paper_id"] != paper_id:
-                            try:
-                                kuzu_client.execute_write(
-                                    "MATCH (p1:Paper {paper_id: $pid1}), "
-                                    "(p2:Paper {paper_id: $pid2}) "
-                                    "CREATE (p1)-[:USES_SAME_METHOD "
-                                    "{method_name: $mname, similarity: $sim}]->(p2)",
-                                    {
-                                        "pid1": paper_id,
-                                        "pid2": ep["p.paper_id"],
-                                        "mname": method_name,
-                                        "sim": sim,
-                                    },
-                                )
-                                cross_paper_edges += 1
-                            except Exception:
-                                pass
-                    break
+                        # Cross-paper USES_SAME_METHOD edge
+                        existing_papers = kuzu_client.execute(
+                            "MATCH (p:Paper)-[:PROPOSES]->(m:Method {node_id: $nid}) "
+                            "RETURN p.paper_id",
+                            {"nid": existing["m.node_id"]},
+                        )
+                        for ep in existing_papers:
+                            if ep["p.paper_id"] != paper_id:
+                                try:
+                                    kuzu_client.execute_write(
+                                        "MATCH (p1:Paper {paper_id: $pid1}), "
+                                        "(p2:Paper {paper_id: $pid2}) "
+                                        "CREATE (p1)-[:USES_SAME_METHOD "
+                                        "{method_name: $mname, similarity: $sim}]->(p2)",
+                                        {
+                                            "pid1": paper_id,
+                                            "pid2": ep["p.paper_id"],
+                                            "mname": method_name,
+                                            "sim": sim,
+                                        },
+                                    )
+                                    cross_paper_edges += 1
+                                except Exception:
+                                    pass
+                        break
 
         if not merged:
             # CREATE new method node
@@ -412,66 +399,66 @@ async def agent_2_graph_builder(
             {"cid": claim_id, "pid": paper_id, "uid": user_id},
         )
 
-        if existing_claims and model is None:
-            model = _get_embedding_model()
-        if model and existing_claims:
-            new_emb = model.encode([claim_text])[0]
-            for existing in existing_claims:
-                if not existing.get("c.text"):
-                    continue
-                existing_emb = model.encode([existing["c.text"]])[0]
-                sim = _cosine_similarity(new_emb, existing_emb)
+        if existing_claims:
+            claim_texts = [claim_text] + [existing.get("c.text", "") for existing in existing_claims]
+            embeddings = await embed_texts(claim_texts)
+            if len(embeddings) > 0:
+                new_emb = embeddings[0]
+                for existing, existing_emb in zip(existing_claims, embeddings[1:]):
+                    if not existing.get("c.text"):
+                        continue
+                    sim = _cosine_similarity(new_emb, existing_emb)
 
-                if sim > CLAIM_COSINE_THRESHOLD:
-                    # Check contradiction via Qwen3
-                    try:
-                        contra_response = await qwen_call(
-                            system_prompt="You are a scientific claim comparison judge. Return JSON.",
-                            user_message=(
-                                f'Do these claims contradict each other?\n'
-                                f'Claim A: "{claim_text}"\n'
-                                f'Claim B: "{existing["c.text"]}"\n'
-                                f'Return: {{"contradicts": true/false, "confidence": 0.0-1.0}}'
-                            ),
-                            json_mode=True,
-                            temperature=0.1,
-                        )
-                        contra = json.loads(contra_response)
-
-                        if contra.get("contradicts") and contra.get("confidence", 0) > CONTRADICTION_CONFIDENCE_THRESHOLD:
-                            # CONTRADICTS edge
-                            kuzu_client.execute_write(
-                                "MATCH (c1:Claim {claim_id: $cid1}), "
-                                "(c2:Claim {claim_id: $cid2}) "
-                                "CREATE (c1)-[:CONTRADICTS "
-                                "{confidence: $conf, evidence_a: $ea, evidence_b: $eb}]->(c2)",
-                                {
-                                    "cid1": claim_id,
-                                    "cid2": existing["c.claim_id"],
-                                    "conf": contra["confidence"],
-                                    "ea": claim_text[:200],
-                                    "eb": existing["c.text"][:200],
-                                },
+                    if sim > CLAIM_COSINE_THRESHOLD:
+                        # Check contradiction via Qwen3
+                        try:
+                            contra_response = await qwen_call(
+                                system_prompt="You are a scientific claim comparison judge. Return JSON.",
+                                user_message=(
+                                    f'Do these claims contradict each other?\n'
+                                    f'Claim A: "{claim_text}"\n'
+                                    f'Claim B: "{existing["c.text"]}"\n'
+                                    f'Return: {{"contradicts": true/false, "confidence": 0.0-1.0}}'
+                                ),
+                                json_mode=True,
+                                temperature=0.1,
                             )
-                            contradictions_detected += 1
-                            cross_paper_edges += 1
-                        elif sim > SUPPORT_COSINE_THRESHOLD:
-                            # SUPPORTS edge
-                            kuzu_client.execute_write(
-                                "MATCH (c1:Claim {claim_id: $cid1}), "
-                                "(c2:Claim {claim_id: $cid2}) "
-                                "CREATE (c1)-[:SUPPORTS {confidence: $conf}]->(c2)",
-                                {
-                                    "cid1": claim_id,
-                                    "cid2": existing["c.claim_id"],
-                                    "conf": sim,
-                                },
-                            )
-                            cross_paper_edges += 1
-                    except Exception as e:
-                        logger.warning(f"Contradiction check failed: {e}")
+                            contra = json.loads(contra_response)
 
-                    break
+                            if contra.get("contradicts") and contra.get("confidence", 0) > CONTRADICTION_CONFIDENCE_THRESHOLD:
+                                # CONTRADICTS edge
+                                kuzu_client.execute_write(
+                                    "MATCH (c1:Claim {claim_id: $cid1}), "
+                                    "(c2:Claim {claim_id: $cid2}) "
+                                    "CREATE (c1)-[:CONTRADICTS "
+                                    "{confidence: $conf, evidence_a: $ea, evidence_b: $eb}]->(c2)",
+                                    {
+                                        "cid1": claim_id,
+                                        "cid2": existing["c.claim_id"],
+                                        "conf": contra["confidence"],
+                                        "ea": claim_text[:200],
+                                        "eb": existing["c.text"][:200],
+                                    },
+                                )
+                                contradictions_detected += 1
+                                cross_paper_edges += 1
+                            elif sim > SUPPORT_COSINE_THRESHOLD:
+                                # SUPPORTS edge
+                                kuzu_client.execute_write(
+                                    "MATCH (c1:Claim {claim_id: $cid1}), "
+                                    "(c2:Claim {claim_id: $cid2}) "
+                                    "CREATE (c1)-[:SUPPORTS {confidence: $conf}]->(c2)",
+                                    {
+                                        "cid1": claim_id,
+                                        "cid2": existing["c.claim_id"],
+                                        "conf": sim,
+                                    },
+                                )
+                                cross_paper_edges += 1
+                        except Exception as e:
+                            logger.warning(f"Contradiction check failed: {e}")
+
+                        break
 
         claim_ids.append(claim_id)
 
