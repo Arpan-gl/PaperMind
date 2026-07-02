@@ -7,6 +7,7 @@ Endpoints:
 """
 
 import logging
+import os
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -18,6 +19,8 @@ from agents.query_agent import agent_3_query_agent
 logger = logging.getLogger("papermind.api.query")
 
 router = APIRouter(tags=["query"])
+
+QUERY_MAX_RETRIES = int(os.environ.get("PAPERMIND_QUERY_MAX_RETRIES", "1"))
 
 
 # ── Models ──────────────────────────────────────────────────────
@@ -74,6 +77,7 @@ async def query(
             agent_fn=agent_3_query_agent,
             input_data={"question": request.question},
             user_id=user_id,
+            max_retries=QUERY_MAX_RETRIES,
         )
     except Exception as e:
         logger.error(f"Query agent failed: {e}")

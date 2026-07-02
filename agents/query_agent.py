@@ -15,8 +15,10 @@ Implements corpus-scoped tri-source retrieval K_fused(q, G_u):
 CRITICAL: unsourced_claims MUST be [] to PASS judge.
 """
 
+import asyncio
 import json
 import logging
+import os
 from typing import Optional
 
 from core.openrouter_client import qwen_call
@@ -28,6 +30,7 @@ logger = logging.getLogger("papermind.agent3")
 LAMBDA_P = 0.50
 LAMBDA_K = 0.35
 LAMBDA_M = 0.15
+QUERY_SYNTHESIS_TIMEOUT_SECONDS = float(os.environ.get("PAPERMIND_QUERY_TIMEOUT_SECONDS", "18"))
 
 AGENT_3_PROMPT = """You are the Query Agent in PaperMind. Answer researcher questions using
 corpus-scoped tri-source retrieval K_fused(q, G_u).
@@ -162,11 +165,14 @@ async def agent_3_query_agent(
     )
 
     try:
-        response = await qwen_call(
-            system_prompt=system_prompt,
-            user_message=f"Answer this question with full citation provenance:\n\n{question}",
-            temperature=0.3,
-            json_mode=True,
+        response = await asyncio.wait_for(
+            qwen_call(
+                system_prompt=system_prompt,
+                user_message=f"Answer this question with full citation provenance:\n\n{question}",
+                temperature=0.3,
+                json_mode=True,
+            ),
+            timeout=QUERY_SYNTHESIS_TIMEOUT_SECONDS,
         )
     except Exception as e:
         logger.warning(f"LLM query synthesis unavailable, using graph fallback: {e}")
